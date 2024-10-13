@@ -1,7 +1,7 @@
 import streamlit as st
 import altair as alt
 import time
-
+import logging
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -20,6 +20,15 @@ from sklearn.model_selection import GridSearchCV, TimeSeriesSplit, train_test_sp
 from scipy.optimize import minimize
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+
+# Configure the logging
+logging.basicConfig(
+    format='%(asctime)s %(levelname)s: %(message)s', 
+    level=logging.INFO,  # You can change this to DEBUG or WARNING based on your need
+    handlers=[
+        logging.StreamHandler()  # Logs to the console (visible in Streamlit logs)
+    ]
+)
 
 ### STREAMLIT APPLICATION
 st.set_page_config(page_title="INSIGHT: Integrated Naïve Forecasting Systems for Interstitial Glucose Forecasting—Hybridized with Machine and Deep Learning Techniques", page_icon="📈")
@@ -125,27 +134,6 @@ def remove_outliers_and_replace_with_median(data, threshold=2):
 def sugar_decay(sugar_series, decay_rate=0.1):
     return sugar_series.ewm(span=10, adjust=False).mean() * decay_rate
 
-@st.cache_resource
-def train_xgboost(X_train, y_train, param_grid):
-    # DEFINE FIXED HYPERPARAMETERS
-    params = {
-        'objective': 'reg:squarederror',
-        'eval_metric': 'rmse',
-        'colsample_bytree': 1.0
-    }
-
-    # INITIALIZE THE XGBREGRESSOR
-    xgb_model = xgb.XGBRegressor(**params, n_estimators=400)
-
-    # SET UP GRIDSEARCHCV
-    grid_search = GridSearchCV(estimator=xgb_model, param_grid=param_grid, 
-                    scoring='neg_mean_squared_error', cv=3, verbose=1)
-
-    # FIT THE MODEL
-    grid_search.fit(X_train, y_train)
-    print(f"Best Parameters: {grid_search.best_params_}")
-    return grid_search.best_estimator_
-
 ## LSTM
 # Define past residuals
 time_step = 230
@@ -158,20 +146,6 @@ def create_dataset(data, time_step=time_step):
         X.append(a)
         y.append(data[i + time_step, 0])
     return np.array(X), np.array(y)
-
-@st.cache_resource
-def build_lstm_model(X_train, y_train, X_val, y_val):
-    model = Sequential()
-    model.add(Input(shape=(time_step, 1)))
-    model.add(LSTM(50, return_sequences=True))
-    model.add(LSTM(50))
-    model.add(Dense(1))
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.1, clipvalue=1.0), loss='mse')
-
-    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-    model.fit(X_train, y_train, epochs=1000, batch_size=32, validation_data=(X_val, y_val), callbacks=[early_stopping])
-
-    return model
 
 # Add user input (food intake)
 def add_sugar_intake(user_sugar_intake):
@@ -240,8 +214,8 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
             # MEAN AND STANDARD DEVIATION OF IGL
             mean_igv = df_cleaned['Interstitial Glucose Value'].mean()
             std_igv = df_cleaned['Interstitial Glucose Value'].std()
-            print(f"Mean of Interstitial Glucose Value: {mean_igv:.2f} mg/dL")
-            print(f"Standard Deviation of Interstitial Glucose Value: {std_igv:.2f} mg/dL")
+            logging.info(f"Mean of Interstitial Glucose Value: {mean_igv:.2f} mg/dL")
+            logging.info(f"Standard Deviation of Interstitial Glucose Value: {std_igv:.2f} mg/dL")
 
             # CELL 3
             # THIS CODE IS FOR THE NAIVE 1 MODEL
@@ -313,8 +287,8 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
             weight_naive1 = 0.58
             weight_naive2 = 0.42  
 
-            print(f"Weight of NAIVE 1: {weight_naive1:.2f}")
-            print(f"Weight of NAIVE 2: {weight_naive2:.2f}")
+            logging.info(f"Weight of NAIVE 1: {weight_naive1:.2f}")
+            logging.info(f"Weight of NAIVE 2: {weight_naive2:.2f}")
 
 
             # INTEGRATION USING WEIGHTED AVERAGE APPROACH
@@ -369,7 +343,7 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
                     # EXOGENOUS VARIABLE: CARBS/SUGAR INTAKE
                     num_nat_dates = current_sugar_df['Date'].isna().sum()
                     if num_nat_dates > 0:
-                        print(f"Warning: {num_nat_dates} dates could not be parsed and are NaT. These will be handled.")
+                        logging.warning(f"Warning: {num_nat_dates} dates could not be parsed and are NaT. These will be handled.")
                         current_sugar_df['Date'] = current_sugar_df['Date'].ffill()
 
                     current_sugar_df.set_index('Date', inplace=True)
@@ -415,6 +389,27 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
                         'max_depth': [8, 9, 10],
                         'subsample': [0.8, 1.0],
                     }
+
+                    @st.cache_resource
+                    def train_xgboost(X_train, y_train, param_grid):
+                        # DEFINE FIXED HYPERPARAMETERS
+                        params = {
+                            'objective': 'reg:squarederror',
+                            'eval_metric': 'rmse',
+                            'colsample_bytree': 1.0
+                        }
+
+                        # INITIALIZE THE XGBREGRESSOR
+                        xgb_model = xgb.XGBRegressor(**params, n_estimators=400)
+
+                        # SET UP GRIDSEARCHCV
+                        grid_search = GridSearchCV(estimator=xgb_model, param_grid=param_grid, 
+                                        scoring='neg_mean_squared_error', cv=3, verbose=1)
+
+                        # FIT THE MODEL
+                        grid_search.fit(X_train, y_train)
+                        logging.info(f"Best Parameters: {grid_search.best_params_}")
+                        return grid_search.best_estimator_
 
                     # GET THE BEST MODEL FROM GRID SEARCH
                     best_xgb_model = train_xgboost(X_train, y_train, param_grid)
@@ -477,6 +472,19 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
                     # SPLIT THE DATA INTO TRAINING AND TEST SET
                     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
+                    @st.cache_resource
+                    def build_lstm_model(X_train, y_train, X_val, y_val):
+                        model = Sequential()
+                        model.add(Input(shape=(time_step, 1)))
+                        model.add(LSTM(50, return_sequences=True))
+                        model.add(LSTM(50))
+                        model.add(Dense(1))
+                        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.1, clipvalue=1.0), loss='mse')
+
+                        early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+                        model.fit(X_train, y_train, epochs=1000, batch_size=32, validation_data=(X_val, y_val), callbacks=[early_stopping])
+
+                        return model
                     history = build_lstm_model(X_train, y_train, X_val, y_val)
 
                     # PREDICT NEXT RESIDUALS
@@ -514,8 +522,8 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
                     future_df = pd.DataFrame({'Future Predicted Glucose': future_forecast}, index=future_index)
 
                     # OUTPUT FUTURE PREDICTIONS
-                    print(future_df)
-                    print(f"Size of future_df: {future_df.size}")
+                    logging.info(future_df)
+                    logging.info(f"Size of future_df: {future_df.size}")
 
                     # CELL 10
 
@@ -529,8 +537,8 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
                     weight_lstm = 0.32 
                     weight_combined = 0.68 
 
-                    print(f"lstm weight: {weight_lstm:.2f}%")
-                    print(f"naive weight: {weight_combined:.2f}%")
+                    logging.info(f"lstm weight: {weight_lstm:.2f}%")
+                    logging.info(f"naive weight: {weight_combined:.2f}%")
 
                     # INTEGRATION USING WEIGHTED AVERAGE APPROACH
                     new_combined_forecast = (weight_lstm * lstm_predicted_values) + (weight_combined * combined_forecast_1)
