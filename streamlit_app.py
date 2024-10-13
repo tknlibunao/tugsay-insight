@@ -125,6 +125,27 @@ def remove_outliers_and_replace_with_median(data, threshold=2):
 def sugar_decay(sugar_series, decay_rate=0.1):
     return sugar_series.ewm(span=10, adjust=False).mean() * decay_rate
 
+@st.cache_resource
+def train_xgboost(X_train, y_train, param_grid):
+    # DEFINE FIXED HYPERPARAMETERS
+    params = {
+        'objective': 'reg:squarederror',
+        'eval_metric': 'rmse',
+        'colsample_bytree': 1.0
+    }
+
+    # INITIALIZE THE XGBREGRESSOR
+    xgb_model = xgb.XGBRegressor(**params, n_estimators=400)
+
+    # SET UP GRIDSEARCHCV
+    grid_search = GridSearchCV(estimator=xgb_model, param_grid=param_grid, 
+                    scoring='neg_mean_squared_error', cv=3, verbose=1)
+
+    # FIT THE MODEL
+    grid_search.fit(X_train, y_train)
+    print(f"Best Parameters: {grid_search.best_params_}")
+    return grid_search.best_estimator_
+
 ## LSTM
 # Define past residuals
 time_step = 230
@@ -137,6 +158,20 @@ def create_dataset(data, time_step=time_step):
         X.append(a)
         y.append(data[i + time_step, 0])
     return np.array(X), np.array(y)
+
+@st.cache_resource
+def build_lstm_model(X_train, y_train, X_val, y_val):
+    model = Sequential()
+    model.add(Input(shape=(time_step, 1)))
+    model.add(LSTM(50, return_sequences=True))
+    model.add(LSTM(50))
+    model.add(Dense(1))
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.1, clipvalue=1.0), loss='mse')
+
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    model.fit(X_train, y_train, epochs=1000, batch_size=32, validation_data=(X_val, y_val), callbacks=[early_stopping])
+
+    return model
 
 # Add user input (food intake)
 def add_sugar_intake(user_sugar_intake):
@@ -374,13 +409,6 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
                     dtrain = xgb.DMatrix(X_train, label=y_train)
                     dtest = xgb.DMatrix(X_test, label=y_test)
 
-                    # DEFINE FIXED HYPERPARAMETERS
-                    params = {
-                        'objective': 'reg:squarederror',
-                        'eval_metric': 'rmse',
-                        'colsample_bytree': 1.0
-                    }
-
                     # DEFINE VALUES FOR HYPERPARAMETER TUNING
                     param_grid = {
                         'eta': [0.1, 0.15, 0.2],
@@ -388,20 +416,8 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
                         'subsample': [0.8, 1.0],
                     }
 
-                    # INITIALIZE THE XGBREGRESSOR
-                    xgb_model = xgb.XGBRegressor(**params, n_estimators=400)
-
-                    # SET UP GRIDSEARCHCV
-                    grid_search = GridSearchCV(estimator=xgb_model, param_grid=param_grid, 
-                                            scoring='neg_mean_squared_error', cv=3, verbose=1)
-
-                    # FIT THE MODEL
-                    grid_search.fit(X_train, y_train)
-
-                    print(f"Best Parameters: {grid_search.best_params_}")
-
                     # GET THE BEST MODEL FROM GRID SEARCH
-                    best_xgb_model = grid_search.best_estimator_
+                    best_xgb_model = train_xgboost(X_train, y_train, param_grid)
 
                     # RECURSIVE FORECASTING: 288 PAST VALUES
                     n_steps = 288
@@ -461,30 +477,14 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
                     # SPLIT THE DATA INTO TRAINING AND TEST SET
                     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
-                    # BUILD LSTM MODEL
-                    model = Sequential()
-                    model.add(Input(shape=(time_step, 1)))  
-                    model.add(LSTM(50, return_sequences=True))
-                    model.add(LSTM(50))
-                    model.add(Dense(1))
-
-                    # COMPILE AND OPTIMIZE MODEL
-                    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.1, clipvalue=1.0), loss='mse')
-
-                    # MODEL TRAINING
-                    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-                    history = model.fit(X_train, y_train, 
-                            epochs=1000, 
-                            batch_size=32, 
-                            validation_data=(X_val, y_val),  
-                            callbacks=[early_stopping])
+                    history = build_lstm_model(X_train, y_train, X_val, y_val)
 
                     # PREDICT NEXT RESIDUALS
                     predictions = []
                     last_input = scaled_residuals[-time_step:].reshape(1, time_step, 1)
 
                     for _ in range(n):
-                        prediction = model.predict(last_input)
+                        prediction = history.predict(last_input)
                         
                         # CHECK FOR NaN OR INFINITE VALUES
                         if np.any(np.isnan(prediction)) or np.any(np.isinf(prediction)):
