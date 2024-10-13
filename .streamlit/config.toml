@@ -4,9 +4,3 @@ backgroundColor="#f5f5f0"
 secondaryBackgroundColor="#e0e0e0"
 textColor="#4e4d4d"
 font = "sans serif"
-
-[server]
-port = 8500
-
-[browser]
-serverPort = 8500
