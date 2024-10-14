@@ -32,6 +32,16 @@ logging.basicConfig(
 
 ### STREAMLIT APPLICATION
 st.set_page_config(page_title="INSIGHT: Integrated Naïve Forecasting Systems for Interstitial Glucose Forecasting—Hybridized with Machine and Deep Learning Techniques", page_icon="📈")
+st.markdown("""
+        <style>
+            h3#forecasted-glucose-levels {
+                color: #004AAD;
+            }
+            h4#simulation-values-tracker {
+                margin-top: 30px;
+            }
+        </style>
+    """, unsafe_allow_html=True)
 
 ### DEFINE FUNCTIONS, SESSION STATES, AND CONSTANTS
 def get_food_data():
@@ -166,6 +176,42 @@ def add_sugar_intake(user_sugar_intake):
 
     st.success(f"Added {user_sugar_intake:.2f} grams of carbohydrates from {st.session_state.selected_food}. Will be used in the next cycle.")
 
+# CACHED FUNCTIONS
+@st.cache_resource
+def train_xgboost(X_train, y_train, param_grid):
+    # DEFINE FIXED HYPERPARAMETERS
+    params = {
+        'objective': 'reg:squarederror',
+        'eval_metric': 'rmse',
+        'colsample_bytree': 1.0
+    }
+
+    # INITIALIZE THE XGBREGRESSOR
+    xgb_model = xgb.XGBRegressor(**params, n_estimators=400)
+
+    # SET UP GRIDSEARCHCV
+    grid_search = GridSearchCV(estimator=xgb_model, param_grid=param_grid, 
+                    scoring='neg_mean_squared_error', cv=3, verbose=1)
+
+    # FIT THE MODEL
+    grid_search.fit(X_train, y_train)
+    # logging.info(f"Best Parameters: {grid_search.best_params_}")
+    return grid_search.best_estimator_
+
+@st.cache_resource
+def build_lstm_model(X_train, y_train, X_val, y_val):
+    model = Sequential()
+    model.add(Input(shape=(time_step, 1)))
+    model.add(LSTM(50, return_sequences=True))
+    model.add(LSTM(50))
+    model.add(Dense(1))
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.1, clipvalue=1.0), loss='mse')
+
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    model.fit(X_train, y_train, epochs=1000, batch_size=32, validation_data=(X_val, y_val), callbacks=[early_stopping])
+
+    return model
+
 # Function to simulate glucose data updates every X minutes with forecasting
 def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_hour_data, interval_minutes=5):
     if st.session_state.is_running:
@@ -176,6 +222,7 @@ def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_
         data_point_counter = st.session_state.data_point_counter  # Keep track of how many data points have been added
         cumulative_added_data = st.session_state.cumulative_added_data  # Keep track of cumulative added data
 
+        st.write('<h4>Simulation Values Tracker</h4>', unsafe_allow_html=True, key="simulation_values_tracker")
         user_input_status_placeholder = st.empty() # Placeholder for testing
         cycle_counter_placeholder = st.empty() # Placeholder for testing counter
 
@@ -197,7 +244,7 @@ def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_
                 cumulative_added_data = pd.concat([cumulative_added_data, new_data_point])
 
                 # Display cumulative added data for checking
-                table_title_placeholder.write("Cumulative Added Data (so far):")
+                table_title_placeholder.write("Cumulative Added Data (CGM):")
                 table_placeholder.write(cumulative_added_data)
 
                 # Display existing sugar_df for reference
@@ -329,6 +376,7 @@ def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_
 
             with chart_section_placeholder:
                 next_update_placeholder.empty()  # Clear the placeholder
+                chart_title_placeholder.write('<h3>Forecasted Glucose Levels</h3>', unsafe_allow_html=True)
                 with st.spinner('Processing glucose data...'):
                     st.toast("Processing glucose data...", icon="📈")
                     
@@ -385,27 +433,6 @@ def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_
                         'max_depth': [8, 9, 10],
                         'subsample': [0.8, 1.0],
                     }
-
-                    @st.cache_resource
-                    def train_xgboost(X_train, y_train, param_grid):
-                        # DEFINE FIXED HYPERPARAMETERS
-                        params = {
-                            'objective': 'reg:squarederror',
-                            'eval_metric': 'rmse',
-                            'colsample_bytree': 1.0
-                        }
-
-                        # INITIALIZE THE XGBREGRESSOR
-                        xgb_model = xgb.XGBRegressor(**params, n_estimators=400)
-
-                        # SET UP GRIDSEARCHCV
-                        grid_search = GridSearchCV(estimator=xgb_model, param_grid=param_grid, 
-                                        scoring='neg_mean_squared_error', cv=3, verbose=1)
-
-                        # FIT THE MODEL
-                        grid_search.fit(X_train, y_train)
-                        # logging.info(f"Best Parameters: {grid_search.best_params_}")
-                        return grid_search.best_estimator_
 
                     # GET THE BEST MODEL FROM GRID SEARCH
                     best_xgb_model = train_xgboost(X_train, y_train, param_grid)
@@ -467,20 +494,6 @@ def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_
 
                     # SPLIT THE DATA INTO TRAINING AND TEST SET
                     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-
-                    @st.cache_resource
-                    def build_lstm_model(X_train, y_train, X_val, y_val):
-                        model = Sequential()
-                        model.add(Input(shape=(time_step, 1)))
-                        model.add(LSTM(50, return_sequences=True))
-                        model.add(LSTM(50))
-                        model.add(Dense(1))
-                        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.1, clipvalue=1.0), loss='mse')
-
-                        early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-                        model.fit(X_train, y_train, epochs=1000, batch_size=32, validation_data=(X_val, y_val), callbacks=[early_stopping])
-
-                        return model
 
                     history = build_lstm_model(X_train, y_train, X_val, y_val)
 
@@ -558,14 +571,13 @@ def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_
                         x='Time:T',
                         y='Glucose Level:Q',
                         color=alt.Color('Type:N', scale=alt.Scale(domain=['Interstitial Glucose', 'Forecasted'], 
-                                                                range=['#529ACC', '#854053']))  # Set specific colors (#1f77b4 - dark blue, #ff7f0e - dark orange)
+                                                                range=['#529ACC', '#854053']))
                     ).properties(
-                        title='Interstitial Glucose Levels (With Forecasted Data)'
+                        title=f'Interstitial Glucose Levels With Forecasted Data (Cycle {st.session_state.data_point_counter + 1})'
                     ).interactive()
 
             st.toast("Done forecasting!", icon="✅")
             # Display the final chart
-            chart_section_placeholder.write('<h3>Forecasted Glucose Levels</h3>', unsafe_allow_html=True)
             chart_placeholder.altair_chart(alt_chart, use_container_width=True)
 
             data_point_counter += 1  # Increment the counter after adding a data point
@@ -684,6 +696,7 @@ if uploaded_glucose_file and uploaded_sugar_file:
         ## !PLACEHOLDER FOR THE FORECASTED GLUCOSE LEVELS CHART
         next_update_placeholder = st.empty()  # This will hold the "Next update in..." message
         chart_section_placeholder = st.empty()
+        chart_title_placeholder = st.empty()
         chart_placeholder = st.empty()
 
         # Run the forecast when the button is clicked
