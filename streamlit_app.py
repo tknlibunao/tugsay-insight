@@ -167,7 +167,7 @@ def add_sugar_intake(user_sugar_intake):
     st.success(f"Added {user_sugar_intake:.2f} grams of carbohydrates from {st.session_state.selected_food}. Will be used in the next cycle.")
 
 # Function to simulate glucose data updates every X minutes with forecasting
-def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_data, interval_minutes=5):
+def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_hour_data, interval_minutes=5):
     if st.session_state.is_running:
         start_time = dt.datetime.now()  # Track start time of the simulation
         run_duration_minutes = 5  # Total simulation time (1 hour) -- CHANGE TO 60 if 1 hour, SET to 5 for demo
@@ -193,7 +193,7 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
             # Add one data point from the last hour every 5 minutes
             if data_point_counter < len(last_hour_data):
                 new_data_point = last_hour_data.iloc[[data_point_counter]]
-                df = pd.concat([df, last_hour_data.iloc[[data_point_counter]]])
+                df_cleaned = pd.concat([df_cleaned, last_hour_data.iloc[[data_point_counter]]])
                 cumulative_added_data = pd.concat([cumulative_added_data, new_data_point])
 
                 # Display cumulative added data for checking
@@ -206,10 +206,6 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
 
             # # Make a copy of sugar_df to avoid in-place modifications
             current_sugar_df= st.session_state.sugar_df.copy()
-
-            # CELL 2
-            # CLEAN THE GLUCOSE DATA
-            df_cleaned = df.dropna(subset=['Interstitial Glucose Value'])
 
             # MEAN AND STANDARD DEVIATION OF IGL
             mean_igv = df_cleaned['Interstitial Glucose Value'].mean()
@@ -408,7 +404,7 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
 
                         # FIT THE MODEL
                         grid_search.fit(X_train, y_train)
-                        logging.info(f"Best Parameters: {grid_search.best_params_}")
+                        # logging.info(f"Best Parameters: {grid_search.best_params_}")
                         return grid_search.best_estimator_
 
                     # GET THE BEST MODEL FROM GRID SEARCH
@@ -485,6 +481,7 @@ def simulate_data_addition_with_forecasting(df, original_sugar_df, last_hour_dat
                         model.fit(X_train, y_train, epochs=1000, batch_size=32, validation_data=(X_val, y_val), callbacks=[early_stopping])
 
                         return model
+
                     history = build_lstm_model(X_train, y_train, X_val, y_val)
 
                     # PREDICT NEXT RESIDUALS
@@ -618,10 +615,14 @@ if uploaded_glucose_file and uploaded_sugar_file:
         sugar_df = pd.read_csv(uploaded_sugar_file)
         sugar_df['Date'] = pd.to_datetime(sugar_df['Date'], format='mixed', dayfirst=True, errors='coerce') # CONVERT DATA WITH FLEXIBLE PARSING
 
-         # Initialize session state for simulation
+        # CELL 2
+        # CLEAN THE GLUCOSE DATA
+        df_cleaned = df.dropna(subset=['Interstitial Glucose Value'])
+        
+        # Initialize session state for simulation
         if 'current_data' not in st.session_state:
-            st.session_state.current_data = df.iloc[:-12]  # Store initial data excluding the last hour (12 points for 5 mins interval)
-            st.session_state.last_hour_data = df.iloc[-12:]  # Last 1 hour of data
+            st.session_state.current_data = df_cleaned.iloc[:-12]  # Store initial data excluding the last hour (12 points for 5 mins interval)
+            st.session_state.last_hour_data = df_cleaned.iloc[-12:]  # Last 1 hour of data
 
         # Initialize sugar_df in session state
         if 'sugar_df' not in st.session_state:
