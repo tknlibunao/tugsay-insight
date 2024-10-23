@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 
 ### STREAMLIT APPLICATION
-st.set_page_config(page_title="INSIGHT: Integrated Naïve Forecasting Systems for Interstitial Glucose Forecasting—Hybridized with Machine and Deep Learning Techniques", page_icon="📈")
+st.set_page_config(page_title="STROMA", page_icon="📉")
 st.markdown("""
         <style>
             h3#forecasted-glucose-levels {
@@ -600,7 +600,7 @@ def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_
 
 ### CONTENT
 ## !TITLE
-st.markdown('<h2><span style="color:#004AAD;">INSIGHT: </span>Integrated Naïve Forecasting Systems for Interstitial Glucose Forecasting—Hybridized with Machine and Deep Learning Techniques</h2>', unsafe_allow_html=True)
+st.markdown('<h1><span style="color:#004AAD;letter-spacing: 0.15em;">STROMA</span></h1>', unsafe_allow_html=True)
 
 ## !PLACEHOLDER FOR MESSAGES
 message_placeholder = st.empty()
