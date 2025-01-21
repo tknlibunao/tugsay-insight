@@ -401,7 +401,7 @@ def add_insulin_data(insulin_type, amount_in_units):
 
     new_row_insulin = pd.DataFrame({
         'Datetime': [date_str],
-        'Type': [insulin_type],
+        'Type': [insulin_type[0].upper()],
         'Insulin Dose': [amount_in_units]
     })
     new_row_insulin['Datetime'] = pd.to_datetime(new_row_insulin['Datetime'], format='mixed', dayfirst=True)
