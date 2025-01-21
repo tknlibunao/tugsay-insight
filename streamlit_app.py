@@ -20,6 +20,7 @@ from sklearn.model_selection import GridSearchCV, TimeSeriesSplit, train_test_sp
 from scipy.optimize import minimize
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import os
 
 # Configure the logging
 logging.basicConfig(
@@ -31,7 +32,7 @@ logging.basicConfig(
 )
 
 ### STREAMLIT APPLICATION
-st.set_page_config(page_title="STROMA", page_icon="📉")
+st.set_page_config(page_title="STROMA", page_icon="📉", layout="wide")
 st.markdown("""
         <style>
             h3#forecasted-glucose-levels {
@@ -46,14 +47,19 @@ st.markdown("""
 ### DEFINE FUNCTIONS, SESSION STATES, AND CONSTANTS
 def get_food_data():
     # Load the CSV file (food data)
-    food_df = pd.read_csv('food_data.csv')
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(script_dir, 'food_data.csv')
+    food_df = pd.read_csv(csv_path)
 
-    # Create a dictionary where food names are the keys (labels) and the carbohydrate amounts are the values
-    food_dict = dict(zip(food_df['Food'], food_df['Amount of carbohydrates, grams per 100 grams']))
-    return food_dict
+    # Create a dictionary where food names are the keys (labels) and the carbohydrate/fat amounts are the values
+    food_dict_carbs = dict(zip(food_df['Food'], food_df['Amount of carbohydrates per 100 grams']))
+    food_dict_fat = dict(zip(food_df['Food'], food_df['Amount of fats per 100 grams']))
+    return food_dict_carbs, food_dict_fat
 
 # FOOD DICTIONARY
-food_dict = get_food_data()
+food_dict_carbs, food_dict_fat = get_food_data()
+# INSULIN TYPES
+insulin_types = ['Fast', 'Intermediate', 'Long']
 
 if 'is_running' not in st.session_state:
     st.session_state.is_running = False
@@ -62,7 +68,7 @@ if 'user_input_status' not in st.session_state:
     st.session_state.user_input_status = "USER INPUT STATUS: (no user input yet)"
 
 if 'selected_food' not in st.session_state:
-    st.session_state.selected_food = sorted(list(food_dict.keys()))[0]
+    st.session_state.selected_food = sorted(list(food_dict_carbs.keys()))[0]
 
 # Store the food amount in session state to persist the input
 if 'amount_in_grams' not in st.session_state:
@@ -79,6 +85,16 @@ if 'cumulative_added_data' not in st.session_state:
     st.session_state.cumulative_added_data = pd.DataFrame()
 
 ## USER INPUT
+# Initialize session states for insulin and exercise input data
+if 'insulin_input_type' not in st.session_state:
+    st.session_state.insulin_input_type = insulin_types[0] # Fast, Intermediate, Long
+
+if 'insulin_input_amount' not in st.session_state:
+    st.session_state.insulin_input_amount = 0.0 # In units
+
+if 'exercise_input_kcal' not in st.session_state:
+    st.session_state.exercise_input_kcal = 0.0 # In kcal
+
 # Update the session state with the selected forecast horizon for LSTM
 def set_selected_forecast_horizon_index(n):
     st.session_state.selected_forecast_horizon_index = n
@@ -110,7 +126,7 @@ def remove_outliers_with_median(series):
     return np.where((series < lower_bound) | (series > upper_bound), median, series)
 
 # Calculate the exponential moving average for Naive 2
-def calculate_ema(series, span=10):
+def calculate_ema(series, span=288):
     return series.ewm(span=span, adjust=False).mean()
 
 ## XGBOOST
@@ -142,11 +158,178 @@ def remove_outliers_and_replace_with_median(data, threshold=2):
 
 # Sugar decay function with exponential moving average
 def sugar_decay(sugar_series, decay_rate=0.1):
-    return sugar_series.ewm(span=10, adjust=False).mean() * decay_rate
+    return sugar_series.ewm(span=36, adjust=False).mean() * decay_rate
 
 ## LSTM
 # Define past residuals
 time_step = 230
+
+# INSULIN DECAY FUNCTION 
+def calculate_dynamic_insulin_effect(insulin_df, glucose_index, decay_rates):
+    """Calculate insulin effect for each time step in the prediction index."""
+    insulin_effect = np.zeros(len(glucose_index))
+
+    for insulin_type, decay_rate in decay_rates.items():
+        current_insulin = insulin_df[insulin_df['Type'] == insulin_type]
+        
+        for idx, dose in current_insulin.iterrows():
+            if idx in glucose_index:
+                start_idx = glucose_index.get_loc(idx)
+                steps = len(glucose_index) - start_idx
+                effect = dose['Normalized Dose'] * np.exp(-decay_rate * np.arange(steps))
+                insulin_effect[start_idx:start_idx + steps] += effect[:steps]
+
+    return insulin_effect
+
+# FAT EFFECT DECAY FUNCTION
+def calculate_fat_effect(fat_df, glucose_index, fat_decay_rates):
+    """
+    Calculate the effect of fat intake on insulin resistance and IGL.
+    """
+    fat_effect = np.zeros(len(glucose_index))
+
+    for quantile, decay_rate in fat_decay_rates.items():
+        current_fat = fat_df[fat_df['Fat Intake Quantile'] == quantile]
+        
+        for idx, intake in current_fat.iterrows():
+            if idx in glucose_index:
+                start_idx = glucose_index.get_loc(idx)
+                steps = len(glucose_index) - start_idx
+                effect = intake['Fat Intake'] * np.exp(-decay_rate * np.arange(steps))
+                fat_effect[start_idx:start_idx + steps] += effect[:steps]
+
+    return fat_effect
+
+# CLASSIFY FAT INTAKE INTO 20 THRESHOLDS
+def classify_fat_intake_20_thresholds(amount):
+    """
+    Classify fat intake into 20 thresholds based on the range 0 to 50 grams.
+    """
+    max_fat = 50
+    num_thresholds = 20
+    step = max_fat / num_thresholds  
+
+    categories = [
+        'very low', 'low', 'slightly low', 'moderate-low', 
+        'moderate', 'moderate-high', 'slightly high', 
+        'high', 'very high', 'extremely high'
+    ]
+
+    # Map every 2 thresholds to a category (10 categories)
+    thresholds = {i: categories[i // 2] for i in range(num_thresholds)}
+
+    for i in range(num_thresholds):
+        lower = i * step
+        upper = (i + 1) * step
+        if lower <= amount < upper:
+            return thresholds[i]
+    return 'out of range'  # For amounts above 50 or below 0
+
+# NORMALIZE CARBOHYDRATE INTAKE VALUES
+def normalize_carb_intake(amount, normal_threshold, max_threshold=762):
+    """
+    Normalize carbohydrate intake values to a range where normal_threshold is centered 
+    and max_threshold is the upper bound.
+    """
+    if amount > max_threshold:
+        return max_threshold
+    return min((amount / normal_threshold) * 100, max_threshold)
+
+# CLASSIFY CARBOHYDRATE INTAKE INTO 100 THRESHOLDS
+def classify_carb_intake_100_thresholds(amount):
+    """
+    Classify normalized carbohydrate intake into 100 thresholds mapped to 10 categories.
+    """
+    step = 762 / 100  # Size of each interval for 100 thresholds
+    categories = [
+        'very low', 'low', 'slightly low', 'moderate-low', 
+        'moderate', 'moderate-high', 'slightly high', 
+        'high', 'very high', 'extremely high'
+    ]
+    thresholds = {i: categories[i // 10] for i in range(100)}  # Map every 10 thresholds to a category
+    
+    for i in range(100):
+        lower = i * step
+        upper = (i + 1) * step
+        if lower <= amount < upper:
+            return thresholds[i]
+    return 'out of range'
+
+# CARBOHYDRATE EFFECT DECAY FUNCTION
+def calculate_carb_effect(carb_df, glucose_index, carb_decay_rates):
+    """Calculate the effect of carbohydrate intake on glucose levels."""
+    carb_effect = np.zeros(len(glucose_index))
+
+    for quantile, decay_rate in carb_decay_rates.items():
+        current_carb = carb_df[carb_df['Carb Intake Quantile'] == quantile]
+        
+        for idx, intake in current_carb.iterrows():
+            if idx in glucose_index:
+                start_idx = glucose_index.get_loc(idx)
+                steps = len(glucose_index) - start_idx
+                effect = intake['Normalized Carb Intake'] * np.exp(-decay_rate * np.arange(steps))
+                carb_effect[start_idx:start_idx + steps] += effect[:steps]
+
+    return carb_effect
+
+# NORMALIZE EXERCISE VALUES TO REFLECT THEIR GLUCOSE-LOWERING EFFECT
+def normalize_exercise(amount, normal_threshold, max_threshold=1000):
+    """
+    Normalize exercise values to a range where normal_threshold is centered 
+    and max_threshold is the upper bound.
+    """
+    if amount > max_threshold:
+        return max_threshold
+    return min((amount / normal_threshold) * 100, max_threshold)
+
+# CLASSIFY EXERCISE INTO 100 THRESHOLDS
+def classify_exercise_100_thresholds(amount):
+    """
+    Classify normalized exercise values into 100 thresholds mapped to 10 categories.
+    """
+    step = 1000 / 100 
+    categories = [
+        'very low', 'low', 'slightly low', 'moderate-low', 
+        'moderate', 'moderate-high', 'slightly high', 
+        'high', 'very high', 'extremely high'
+    ]
+    thresholds = {i: categories[i // 10] for i in range(100)}  
+    
+    for i in range(100):
+        lower = i * step
+        upper = (i + 1) * step
+        if lower <= amount < upper:
+            return thresholds[i]
+    return 'out of range'
+
+# EXERCISE EFFECT DECAY FUNCTION
+def calculate_exercise_effect(exercise_df, glucose_index, exercise_decay_rates):
+    """Calculate the effect of exercise on glucose levels."""
+    exercise_effect = np.zeros(len(glucose_index))
+
+    for quantile, decay_rate in exercise_decay_rates.items():
+        current_exercise = exercise_df[exercise_df['Exercise Quantile'] == quantile]
+        
+        for idx, activity in current_exercise.iterrows():
+            if idx in glucose_index:
+                start_idx = glucose_index.get_loc(idx)
+                steps = len(glucose_index) - start_idx
+                effect = activity['Normalized Exercise'] * np.exp(-decay_rate * np.arange(steps))
+                exercise_effect[start_idx:start_idx + steps] += effect[:steps]
+
+    return exercise_effect
+
+# Adding a category based on glucose level
+min_glucose_level = 70
+max_glucose_level = 120
+
+def categorize_glucose(x):
+    if x < min_glucose_level:
+        return 'Hypoglycemia'
+    elif min_glucose_level <= x <= max_glucose_level:
+        return 'Normal'
+    else:
+        return 'Hyperglycemia'
 
 # Create dataset
 def create_dataset(data, time_step=time_step):
@@ -158,23 +341,111 @@ def create_dataset(data, time_step=time_step):
     return np.array(X), np.array(y)
 
 # Add user input (food intake)
-def add_sugar_intake(user_sugar_intake):
-    st.session_state.user_input_status = "USER INPUT STATUS: (has added some user sugar intake)"
+def add_food_intake(amount_in_grams):
+    st.session_state.user_input_status = "USER INPUT STATUS: (has added some food intake)"
+
+    # Calculate the intake values
+    user_sugar_intake = food_dict_carbs[st.session_state.selected_food] * amount_in_grams / 100
+    user_carb_intake = user_sugar_intake
+    user_fat_intake = food_dict_fat[st.session_state.selected_food] * amount_in_grams / 100 
     
-    # Create a DataFrame for the new row
-    new_row = pd.DataFrame({
-        'Date': [pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:00')],
+    # Get current timestamp in the correct format
+    current_time = pd.Timestamp.now()
+    date_str = current_time.strftime('%d/%m/%Y %H:%M')  # Match the existing format
+    
+    # Create DataFrames for new rows
+    new_row_sugar = pd.DataFrame({
+        'Date': [date_str],
         'SugarIntake': [user_sugar_intake]
     })
+    new_row_sugar['Date'] = pd.to_datetime(new_row_sugar['Date'], format='mixed', dayfirst=True)
 
-    # Append the new row to the sugar_df in session state
-    st.session_state.sugar_df = pd.concat([st.session_state.sugar_df, new_row], ignore_index=True)
+    new_row_carb = pd.DataFrame({
+        'Datetime': [date_str],
+        'Carbohydrate Intake': [user_carb_intake]
+    })
+    new_row_carb['Datetime'] = pd.to_datetime(new_row_carb['Datetime'], format='mixed', dayfirst=True)
 
-    # Sort the sugar_df by Date to ensure it's monotonic
-    st.session_state.sugar_df['Date'] = pd.to_datetime(st.session_state.sugar_df['Date'])
+    new_row_fat = pd.DataFrame({
+        'Datetime': [date_str],
+        'Fat Intake': [user_fat_intake]
+    })
+    new_row_fat['Datetime'] = pd.to_datetime(new_row_fat['Datetime'], format='mixed', dayfirst=True)
+
+    # Ensure datetime columns in session state DataFrames are datetime type
+    if 'sugar_df' in st.session_state:
+        st.session_state.sugar_df['Date'] = pd.to_datetime(st.session_state.sugar_df['Date'], format='mixed', dayfirst=True)
+    if 'carb_df' in st.session_state:
+        st.session_state.carb_df['Datetime'] = pd.to_datetime(st.session_state.carb_df['Datetime'], format='mixed', dayfirst=True)
+    if 'fat_df' in st.session_state:
+        st.session_state.fat_df['Datetime'] = pd.to_datetime(st.session_state.fat_df['Datetime'], format='mixed', dayfirst=True)
+
+    # Append new rows
+    st.session_state.sugar_df = pd.concat([st.session_state.sugar_df, new_row_sugar], ignore_index=True)
+    st.session_state.carb_df = pd.concat([st.session_state.carb_df, new_row_carb], ignore_index=True)
+    st.session_state.fat_df = pd.concat([st.session_state.fat_df, new_row_fat], ignore_index=True)
+
+    # Sort all DataFrames by their respective datetime columns
     st.session_state.sugar_df = st.session_state.sugar_df.sort_values(by='Date').reset_index(drop=True)
+    st.session_state.carb_df = st.session_state.carb_df.sort_values(by='Datetime').reset_index(drop=True)
+    st.session_state.fat_df = st.session_state.fat_df.sort_values(by='Datetime').reset_index(drop=True)
 
-    st.success(f"Added {user_sugar_intake:.2f} grams of carbohydrates from {st.session_state.selected_food}. Will be used in the next cycle.")
+    st.success(f"Added {user_sugar_intake:.2f} grams of sugar, {user_carb_intake:.2f} grams of carbohydrates, and {user_fat_intake:.2f} grams of fat from {st.session_state.selected_food}. Will be used in the next cycle.")
+
+def add_insulin_data(insulin_type, amount_in_units):
+    st.session_state.user_input_status = "USER INPUT STATUS: (has added some insulin data)"
+
+    # Get current timestamp in the correct format
+    current_time = pd.Timestamp.now()
+    date_str = current_time.strftime('%d/%m/%Y %H:%M')  # Match the existing format
+
+    new_row_insulin = pd.DataFrame({
+        'Datetime': [date_str],
+        'Type': [insulin_type],
+        'Insulin Dose': [amount_in_units]
+    })
+    new_row_insulin['Datetime'] = pd.to_datetime(new_row_insulin['Datetime'], format='mixed', dayfirst=True)
+
+    # Ensure datetime column in session state DataFrame is datetime type
+    if 'insulin_df' in st.session_state:
+        st.session_state.insulin_df['Datetime'] = pd.to_datetime(
+            st.session_state.insulin_df['Datetime'], 
+            format='mixed', 
+            dayfirst=True
+        )
+
+    st.session_state.insulin_df = pd.concat([st.session_state.insulin_df, new_row_insulin], ignore_index=True)
+    st.session_state.insulin_df = st.session_state.insulin_df.sort_values(by='Datetime').reset_index(drop=True)
+
+    st.success(f"Added {amount_in_units:.2f} units of {insulin_type} insulin. Will be used in the next cycle.")
+
+def add_exercise_data(amount_in_kcal):
+    st.session_state.user_input_status = "USER INPUT STATUS: (has added some exercise data)"
+
+    # Get current timestamp in the correct format
+    current_time = pd.Timestamp.now()
+    date_str = current_time.strftime('%d/%m/%Y %H:%M')  # Match the existing format
+    
+    new_row_exercise = pd.DataFrame({
+        'Datetime': [date_str],
+        'Exercise (kcal)': [amount_in_kcal]
+    })
+
+    # Convert datetime column
+    new_row_exercise['Datetime'] = pd.to_datetime(new_row_exercise['Datetime'], format='mixed', dayfirst=True)
+
+    # Ensure datetime column in session state DataFrame is datetime type
+    if 'exercise_df' in st.session_state:
+        st.session_state.exercise_df['Datetime'] = pd.to_datetime(
+            st.session_state.exercise_df['Datetime'], 
+            format='mixed', 
+            dayfirst=True
+        )
+
+    st.session_state.exercise_df = pd.concat([st.session_state.exercise_df, new_row_exercise], ignore_index=True)
+    st.session_state.exercise_df = st.session_state.exercise_df.sort_values(by='Datetime').reset_index(drop=True)
+
+    st.success(f"Added {amount_in_kcal:.2f} kcal of exercise. Will be used in the next cycle.")
 
 # CACHED FUNCTIONS
 @st.cache_resource
@@ -213,7 +484,7 @@ def build_lstm_model(X_train, y_train, X_val, y_val):
     return model
 
 # Function to simulate glucose data updates every X minutes with forecasting
-def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_hour_data, interval_minutes=5):
+def simulate_data_addition_with_forecasting(df_cleaned, last_hour_data, interval_minutes_demo=5):
     if st.session_state.is_running:
         start_time = dt.datetime.now()  # Track start time of the simulation
         run_duration_minutes = 5  # Total simulation time (1 hour) -- CHANGE TO 60 if 1 hour, SET to 5 for demo
@@ -226,11 +497,34 @@ def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_
         user_input_status_placeholder = st.empty() # Placeholder for testing
         cycle_counter_placeholder = st.empty() # Placeholder for testing counter
 
-        table_title_placeholder = st.empty()  # Placeholder for the table title
-        table_placeholder = st.empty()  # Placeholder for the table
 
-        sugar_table_title_placeholder = st.empty()  # Placeholder for the sugar table title
-        sugar_table_placeholder = st.empty()  # Placeholder for the sugar table
+        with st.container(border=True):
+            st.write('<h4>Glucose, Insulin, Exercise Data</h4>', unsafe_allow_html=True, key="glucose_data")
+            col_1, col_2, col_3 = st.columns(3)
+            with col_1: 
+                table_title_placeholder = st.empty()  # Placeholder for the table title
+                table_placeholder = st.empty()  # Placeholder for the table
+            with col_2: 
+                insulin_table_title_placeholder = st.empty()  # Placeholder for the insulin table title
+                insulin_table_placeholder = st.empty()  # Placeholder for the insulin table
+            with col_3: 
+                exercise_table_title_placeholder = st.empty()  # Placeholder for the exercise table title
+                exercise_table_placeholder = st.empty()  # Placeholder for the exercise table
+
+        with st.container(border=True):
+            st.write('<h4>Sugar, Fat, Carbohydrate Data</h4>', unsafe_allow_html=True, key="sugar_data")
+            col_4, col_5, col_6 = st.columns(3)
+            with col_4:
+                sugar_table_title_placeholder = st.empty()  # Placeholder for the sugar table title
+                sugar_table_placeholder = st.empty()  # Placeholder for the sugar table
+            with col_5:
+                fat_table_title_placeholder = st.empty()  # Placeholder for the fat table title
+                fat_table_placeholder = st.empty()  # Placeholder for the fat table
+            with col_6:
+                carb_table_title_placeholder = st.empty()  # Placeholder for the carb table title
+                carb_table_placeholder = st.empty()  # Placeholder for the carb table
+
+        
 
         while elapsed_time < run_duration_minutes and st.session_state.is_running:
             user_input_status_placeholder.write(st.session_state.user_input_status)
@@ -246,16 +540,46 @@ def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_
                 # Display cumulative added data for checking
                 table_title_placeholder.write("Cumulative Added Data (CGM):")
                 table_placeholder.write(cumulative_added_data)
+                # Display the current insulin_df
+                insulin_table_title_placeholder.write("Current Insulin DataFrame:")
+                insulin_table_placeholder.write(st.session_state.insulin_df)
 
+                # Display the current exercise_df
+                exercise_table_title_placeholder.write("Current Exercise DataFrame:")
+                exercise_table_placeholder.write(st.session_state.exercise_df)
+                
                 # Display existing sugar_df for reference
                 sugar_table_title_placeholder.write("Current Sugar DataFrame:")
                 sugar_table_placeholder.write(st.session_state.sugar_df)
 
+                # Display the current fat_df
+                fat_table_title_placeholder.write("Current Fat DataFrame:")
+                fat_table_placeholder.write(st.session_state.fat_df)
+
+                # Display the current carb_df
+                carb_table_title_placeholder.write("Current Carb DataFrame:")
+                carb_table_placeholder.write(st.session_state.carb_df)
+
+
+
             # # Make a copy of sugar_df to avoid in-place modifications
             current_sugar_df= st.session_state.sugar_df.copy()
 
+            # Make a copy of insulin_df to avoid in-place modifications
+            current_insulin_df = st.session_state.insulin_df.copy()
+
+            # Make a copy of fat_df to avoid in-place modifications
+            current_fat_df = st.session_state.fat_df.copy()
+
+            # Make a copy of carb_df to avoid in-place modifications
+            current_carb_df = st.session_state.carb_df.copy()
+
+            # Make a copy of exercise_df to avoid in-place modifications
+            current_exercise_df = st.session_state.exercise_df.copy()
+
             # MEAN AND STANDARD DEVIATION OF IGL
             mean_igv = df_cleaned['Interstitial Glucose Value'].mean()
+            st.session_state.mean_igv = mean_igv
             std_igv = df_cleaned['Interstitial Glucose Value'].std()
             logging.info(f"Mean of Interstitial Glucose Value: {mean_igv:.2f} mg/dL")
             logging.info(f"Standard Deviation of Interstitial Glucose Value: {std_igv:.2f} mg/dL")
@@ -371,7 +695,14 @@ def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_
                 y='Glucose Level:Q',
                 color=alt.Color('Type:N', scale=alt.Scale(domain=['Interstitial Glucose'], range=['#529acc']))  # Color for chart
             ).properties(
-                title='Interstitial Glucose Levels (Initial Data)'
+                title='Interstitial Glucose Levels (Initial Data)',
+                width=700,
+                height=400
+            ).configure_title(
+                fontSize=16,
+                fontWeight='bold',
+                anchor='middle',
+                align='center'
             )
 
             with chart_section_placeholder:
@@ -557,23 +888,224 @@ def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_
                     future_index = pd.date_range(start=forecast_df.index[-1], periods=n, freq='5min')
                     new_combined_df = pd.DataFrame({'New Combined Forecast': new_combined_forecast}, index=future_index)
 
+                    # CELL 12 (INSULIN EFFECT)
+                    # CLEAN INSULIN DATA
+                    current_insulin_df = current_insulin_df.dropna()
+                    current_insulin_df['Datetime'] = pd.to_datetime(current_insulin_df['Datetime'], format='mixed', dayfirst=True, errors='coerce')
+                    current_insulin_df = current_insulin_df.set_index('Datetime')  # Set datetime as index
+
+                    # NORMALIZE INSULIN DOSES TO REFLECT THEIR GLUCOSE-LOWERING EFFECT
+                    dose_scaling_factor = std_igv 
+                    current_insulin_df['Normalized Dose'] = current_insulin_df['Insulin Dose'] / dose_scaling_factor
+
+                    # DECAY TIME SPANS IN HOURS 
+                    time_spans = {'F': 2.5, 'I': 8, 'L': 5} 
+                    interval_minutes = 5
+
+                    # CONVERT DECAY RATES BASED ON 5-MINUTES TIME INTERVALS 
+                    decay_rates = {
+                        insulin_type: np.log(2) / ((time_span * 60) / interval_minutes)
+                        for insulin_type, time_span in time_spans.items()
+                    }
+
+                    # COMBINE THE INSULIN EFFECT WITH THE FINAL PREDICTION 
+                    insulin_effect = calculate_dynamic_insulin_effect(current_insulin_df, new_combined_df.index, decay_rates)
+                
+                    # Create a copy to avoid modifying the original
+                    new_combined_df['Adjusted Prediction (with Insulin Effect)'] = new_combined_df['New Combined Forecast'].copy()
+                    new_combined_df['Adjusted Prediction (with Insulin Effect)'] = new_combined_df['Adjusted Prediction (with Insulin Effect)'] - insulin_effect
+                    new_combined_df['Adjusted Prediction (with Insulin Effect)'] = new_combined_df['Adjusted Prediction (with Insulin Effect)'].clip(lower=0)
+
+                    # CELL 13 (FAT EFFECT)
+                    # CLEAN FAT INTAKE DATA
+                    current_fat_df = current_fat_df.dropna()
+                    current_fat_df['Datetime'] = pd.to_datetime(current_fat_df['Datetime'], format='mixed', dayfirst=True, errors='coerce')
+                    current_fat_df = current_fat_df.set_index('Datetime')  # Set datetime as index
+
+                    current_fat_df['Fat Intake Quantile'] = current_fat_df['Fat Intake'].apply(classify_fat_intake_20_thresholds)
+
+                    # FAT EFFECT DURATION IN HOURS (UPDATED FOR EACH QUANTILE)
+                    fat_effect_base_hours = {
+                        'very low': 1.0, 'low': 1.5, 'slightly low': 2.0, 'moderate-low': 2.5,
+                        'moderate': 3.0, 'moderate-high': 3.5, 'slightly high': 4.0, 
+                        'high': 4.5, 'very high': 5.0, 'extremely high': 5.5
+                    }
+                    interval_minutes = 5
+
+                    # CONVERT FAT EFFECT DECAY RATES BASED ON 5-MINUTE INTERVALS
+                    fat_decay_rates = {
+                        quantile: np.log(2) / ((hours * 60) / interval_minutes)
+                        for quantile, hours in fat_effect_base_hours.items()
+                    }
+
+                    # CALCULATE FAT EFFECT
+                    fat_effect = calculate_fat_effect(current_fat_df, new_combined_df.index, fat_decay_rates)
+
+                    # COMBINE THE FAT EFFECT WITH THE FINAL PREDICTION
+                    # Create a copy to avoid modifying the original
+                    new_combined_df['Adjusted Prediction (with Insulin + Fat Effects)'] = (
+                        new_combined_df['Adjusted Prediction (with Insulin Effect)'].copy() + fat_effect
+                    )
+                    new_combined_df['Adjusted Prediction (with Insulin + Fat Effects)'] = new_combined_df['Adjusted Prediction (with Insulin + Fat Effects)'].clip(lower=0)
+
+
+                    # CELL 14 (CARBS EFFECT)
+                    # CLEAN CARBOHYDRATE INTAKE DATA
+                    current_carb_df = current_carb_df.dropna()
+                    current_carb_df['Datetime'] = pd.to_datetime(current_carb_df['Datetime'], format='mixed', dayfirst=True, errors='coerce')
+                    current_carb_df = current_carb_df.set_index('Datetime')  # Set datetime as index
+
+                    current_carb_df['Normalized Carb Intake'] = current_carb_df['Carbohydrate Intake'].apply(
+                        lambda x: normalize_carb_intake(x, st.session_state.mean_igv * 2)
+                    )
+
+                    current_carb_df['Carb Intake Quantile'] = current_carb_df['Normalized Carb Intake'].apply(classify_carb_intake_100_thresholds)
+
+                    # CARBOHYDRATE EFFECT DURATION IN HOURS (MAPPED TO 10 CATEGORIES)
+                    carb_effect_base_hours = {
+                        'very low': 1.0,
+                        'low': 1.5,
+                        'slightly low': 2.0,
+                        'moderate-low': 2.5,
+                        'moderate': 3.0,
+                        'moderate-high': 3.5,
+                        'slightly high': 4.0,
+                        'high': 4.5,
+                        'very high': 5.0,
+                        'extremely high': 5.5
+                    }
+                    interval_minutes = 5
+
+                    # CONVERT CARBOHYDRATE EFFECT DECAY RATES BASED ON 5-MINUTE INTERVALS
+                    carb_decay_rates = {
+                        quantile: np.log(2) / ((hours * 60) / interval_minutes)
+                        for quantile, hours in carb_effect_base_hours.items()
+                    }
+
+                    # CALCULATE CARBOHYDRATE EFFECT
+                    carb_effect = calculate_carb_effect(current_carb_df, new_combined_df.index, carb_decay_rates)
+
+                    # COMBINE THE CARBOHYDRATE EFFECT WITH THE FINAL PREDICTION
+                    # Create a copy to avoid modifying the original
+                    new_combined_df['Adjusted Prediction (with Insulin + Fat + Carb Effects)'] = (
+                        new_combined_df['Adjusted Prediction (with Insulin + Fat Effects)'].copy() + carb_effect
+                    )
+                    new_combined_df['Adjusted Prediction (with Insulin + Fat + Carb Effects)'] = new_combined_df['Adjusted Prediction (with Insulin + Fat + Carb Effects)'].clip(lower=0)
+
+
+                    # CELL 15 (EXERCISE EFFECT)
+                    # CLEAN EXERCISE DATA
+                    current_exercise_df = current_exercise_df.dropna()
+                    current_exercise_df['Datetime'] = pd.to_datetime(current_exercise_df['Datetime'], format='mixed', dayfirst=True, errors='coerce')
+                    current_exercise_df = current_exercise_df.set_index('Datetime')  # Set datetime as index
+
+                    current_exercise_df['Normalized Exercise'] = current_exercise_df['Exercise (kcal)'].apply(lambda x: normalize_exercise(x, st.session_state.mean_igv * 10))
+
+                    current_exercise_df['Exercise Quantile'] = current_exercise_df['Normalized Exercise'].apply(classify_exercise_100_thresholds)
+
+                    # EXERCISE EFFECT DURATION IN HOURS (MAPPED TO 10 CATEGORIES)
+                    exercise_effect_base_hours = {
+                        'very low': 2.0,
+                        'low': 3.0,
+                        'slightly low': 4.0,
+                        'moderate-low': 5.0,
+                        'moderate': 6.0,
+                        'moderate-high': 7.0,
+                        'slightly high': 8.0,
+                        'high': 9.0,
+                        'very high': 10.0,
+                        'extremely high': 11.0
+                    }
+                    interval_minutes = 5
+
+                    # CONVERT EXERCISE EFFECT DECAY RATES BASED ON 5-MINUTE INTERVALS
+                    exercise_decay_rates = {
+                        quantile: np.log(2) / ((hours * 60) / interval_minutes)
+                        for quantile, hours in exercise_effect_base_hours.items()
+                    }
+
+                    # CALCULATE EXERCISE EFFECT
+                    exercise_effect = calculate_exercise_effect(current_exercise_df, new_combined_df.index, exercise_decay_rates)
+
+                    # COMBINE THE EXERCISE EFFECT WITH THE FINAL PREDICTION
+                    # Create a copy to avoid modifying the original
+                    new_combined_df['Prediction (with Insulin + Fat + Carb + Exercise Effects)'] = (
+                        new_combined_df['Adjusted Prediction (with Insulin + Fat + Carb Effects)'].copy() - exercise_effect
+                    )
+                    new_combined_df['Prediction (with Insulin + Fat + Carb + Exercise Effects)'] = new_combined_df['Prediction (with Insulin + Fat + Carb + Exercise Effects)'].clip(lower=0)
+
                     # CELL 11
                     # PLOT (USING ALTAIR)
-                    # Combine both actual glucose and forecasted glucose into a single dataframe for Altair
+                    # Combine all data into a single dataframe for Altair
                     combined_data = pd.DataFrame({
                         'Time': pd.concat([pd.Series(df_cleaned.index), pd.Series(new_combined_df.index)]).reset_index(drop=True),
-                        'Glucose Level': pd.concat([df_cleaned['Interstitial Glucose Value'], new_combined_df['New Combined Forecast']]).reset_index(drop=True),
-                        'Type': ['Interstitial Glucose'] * len(df_cleaned) + ['Forecasted'] * len(new_combined_df)
+                        'Glucose Level': pd.concat([df_cleaned['Interstitial Glucose Value'], new_combined_df['Prediction (with Insulin + Fat + Carb + Exercise Effects)']]).reset_index(drop=True),
+                        'Type': ['Interstitial Glucose'] * len(df_cleaned) + ['Prediction (with Insulin + Fat + Carb + Exercise Effects)'] * len(new_combined_df)
                     })
 
-                    # Create the Altair line chart with custom colors
-                    alt_chart = alt.Chart(combined_data).mark_line().encode(
-                        x='Time:T',
-                        y='Glucose Level:Q',
-                        color=alt.Color('Type:N', scale=alt.Scale(domain=['Interstitial Glucose', 'Forecasted'], 
-                                                                range=['#529ACC', '#854053']))
+                    combined_data['Glucose Category'] = combined_data['Glucose Level'].apply(categorize_glucose)
+
+                    # Create the base chart with tooltip encoding
+                    base = alt.Chart(combined_data).encode(
+                        x=alt.X('Time:T', axis=alt.Axis(format='%b %d, %Y (%-I%p)', tickCount=24)),  # Show hour and minute for every tick
+                        tooltip=[
+                            alt.Tooltip('Time:T', title='Time', format='%b %d, %Y (%-I%p)'),
+                            alt.Tooltip('Glucose Level:Q', title='Glucose Level', format='.1f'),
+                            alt.Tooltip('Type:N', title='Type'),
+                            alt.Tooltip('Glucose Category:N', title='Status')  # Include the glucose category in the tooltip
+                        ]
                     ).properties(
-                        title=f'Interstitial Glucose Levels With Forecasted Data (Cycle {st.session_state.data_point_counter + 1})'
+                        title=f'Glucose Level Forecast with Insulin, Fat, Carb, and Exercise Effects (Cycle {st.session_state.data_point_counter + 1})',
+                        width=700,
+                        height=700
+                    )
+
+                    # Create glucose line
+                    glucose_line = base.mark_line(color='#529ACC').encode(
+                        y=alt.Y('Glucose Level:Q', title='Glucose Level (mg/dL)')
+                    ).transform_filter(
+                        alt.datum.Type == 'Interstitial Glucose'
+                    )
+
+                    # Adjusted prediction line
+                    adjusted_prediction_line = base.mark_line(color='green').encode(
+                        y='Glucose Level:Q'
+                    ).transform_filter(
+                        alt.datum.Type == 'Prediction (with Insulin + Fat + Carb + Exercise Effects)'
+                    )
+
+                    # Points for outliers in the adjusted prediction
+                    outlier_points = base.mark_point(size=50, filled=True).encode(
+                        y='Glucose Level:Q',
+                        color=alt.condition(
+                            (alt.datum['Glucose Level'] < min_glucose_level) | (alt.datum['Glucose Level'] > max_glucose_level),
+                            alt.value('red'),  # Red points for outliers
+                            alt.value('transparent')  # Transparent for non-outliers
+                        )
+                    ).transform_filter(
+                        alt.datum.Type == 'Prediction (with Insulin + Fat + Carb + Exercise Effects)'
+                    )
+
+                    # Combine the layers
+                    alt_chart = (glucose_line + adjusted_prediction_line + outlier_points).encode(
+                        color=alt.Color('Type:N', 
+                                scale=alt.Scale(domain=['Interstitial Glucose', 'Prediction (with Insulin + Fat + Carb + Exercise Effects)'],
+                                            range=['#529ACC', '#008B8B']),
+                                legend=alt.Legend(
+                                    orient='bottom',
+                                    direction='horizontal',   
+                                    titleOrient='top',
+                                    padding=20,
+                                    offset=0,
+                                    labelLimit=500,
+                                    symbolSize=500,
+                                ))
+                    ).properties(
+                        padding={"left": 50, "right": 50, "top": 50, "bottom": 50}
+                    ).configure_title(
+                        fontSize=16,
+                        anchor='middle',
+                        align='center'
                     ).interactive()
 
             st.toast("Done forecasting!", icon="✅")
@@ -585,7 +1117,7 @@ def simulate_data_addition_with_forecasting(df_cleaned, original_sugar_df, last_
             st.session_state.cumulative_added_data = cumulative_added_data  # Update the session state
             
             # Sleep for 5 minutes to simulate interval (change to 5 seconds for testing)
-            for remaining in range(interval_minutes * 60, 0, -1):
+            for remaining in range(interval_minutes_demo * 60, 0, -1):
                 next_update_placeholder.info(f"Next update in {remaining // 60}:{remaining % 60:02d}")
                 time.sleep(1)  # Sleep for 1 second during countdown
 
@@ -606,26 +1138,45 @@ st.markdown('<h1><span style="color:#004AAD;letter-spacing: 0.15em;">STROMA</spa
 message_placeholder = st.empty()
 
 ## !FILE UPLOAD SECTION
-st.write('<h4>Upload CSVs</h4>', unsafe_allow_html=True)
+st.write('<h4>Upload CSV Files</h4>', unsafe_allow_html=True)
 
-col_1, col_2 = st.columns(2)
-with col_1:
-    uploaded_glucose_file = st.file_uploader("Choose the **Glucose Data** CSV file", type="csv")
-with col_2:
-    uploaded_sugar_file = st.file_uploader("Choose the **Sugar Intake** CSV file", type="csv")
+with st.container(border=True):
+    st.write('<h5>Glucose, Insulin, Exercise Data</h5>', unsafe_allow_html=True)
+    col_1, col_2, col_3 = st.columns(3, gap='large')
+    with col_1:
+        uploaded_glucose_file = st.file_uploader("**Glucose Data** CSV file", type="csv")
+    with col_2:
+        uploaded_insulin_file = st.file_uploader("**Insulin Data** CSV file", type="csv")
+    with col_3:
+        uploaded_exercise_file = st.file_uploader("**Exercise Data** CSV file", type="csv")
 
-if uploaded_glucose_file and uploaded_sugar_file:
+with st.container(border=True):
+    st.write('<h5>Sugar, Fat, Carb Intake Data</h5>', unsafe_allow_html=True)
+    col_4, col_5, col_6 = st.columns(3, gap='large')
+    with col_4:
+        uploaded_sugar_file = st.file_uploader("**Sugar Intake** CSV file", type="csv")
+    with col_5:
+        uploaded_fat_file = st.file_uploader("**Fat Intake** CSV file", type="csv")
+    with col_6:
+        uploaded_carb_file = st.file_uploader("**Carb Intake** CSV file", type="csv")
+
+if uploaded_glucose_file and uploaded_sugar_file and uploaded_insulin_file and uploaded_fat_file and uploaded_carb_file and uploaded_exercise_file:
     # Read the CSV files
     try:
         # File upload success message
         message_placeholder.success("Files uploaded successfully!")
 
-        # Load the CSV files (Glucose and Sugar Intake)
+        # Load the CSV files (Glucose, Sugar Intake, Insulin, Fat Intake, Carb Intake, Exercise)
         df = pd.read_csv(uploaded_glucose_file, index_col='Datetime', dtype={'Datetime': 'object'})
         df.index = pd.to_datetime(df.index, format='%d/%m/%Y %H:%M', errors='coerce')
 
         sugar_df = pd.read_csv(uploaded_sugar_file)
         sugar_df['Date'] = pd.to_datetime(sugar_df['Date'], format='mixed', dayfirst=True, errors='coerce') # CONVERT DATA WITH FLEXIBLE PARSING
+
+        insulin_df = pd.read_csv(uploaded_insulin_file)
+        fat_df = pd.read_csv(uploaded_fat_file)
+        carb_df = pd.read_csv(uploaded_carb_file)
+        exercise_df = pd.read_csv(uploaded_exercise_file)
 
         # CELL 2
         # CLEAN THE GLUCOSE DATA
@@ -641,24 +1192,92 @@ if uploaded_glucose_file and uploaded_sugar_file:
             # Initial sugar_df structure
             st.session_state.sugar_df = sugar_df.copy()
 
+        # Initialize insulin_df in session state
+        if 'insulin_df' not in st.session_state:
+            # Initial insulin_df structure
+            st.session_state.insulin_df = insulin_df.copy()
 
-        ## !USER FOOD INTAKE SECTION (USER INPUT)
-        # Dropdown for food items and user input for the amount in grams
-        with st.form("sugar_input_form"):  # Use a form to prevent immediate reruns
-            st.write('<h4>User Food Intake</h4>', unsafe_allow_html=True)
+        # Initialize fat_df in session state
+        if 'fat_df' not in st.session_state:
+            # Initial fat_df structure
+            st.session_state.fat_df = fat_df.copy()
 
-            col_1, col_2 = st.columns(2)
-            with col_1:
-                st.session_state.selected_food = st.selectbox("Select a food item:", sorted(list(food_dict.keys())), 
-                                                    index=sorted(list(food_dict.keys())).index(st.session_state.selected_food))
+        # Initialize carb_df in session state
+        if 'carb_df' not in st.session_state:
+            # Initial carb_df structure
+            st.session_state.carb_df = carb_df.copy()
 
-            with col_2:
-                st.session_state.amount_in_grams = st.number_input('Amount (grams):', min_value=0.0, max_value=1000.0, step=0.1, value=st.session_state.amount_in_grams)
-            
-            submitted = st.form_submit_button("Add Sugar Intake", use_container_width=True)
-    
-            if submitted:
-                add_sugar_intake(food_dict[st.session_state.selected_food] * st.session_state.amount_in_grams / 100)
+        # Initialize exercise_df in session state
+        if 'exercise_df' not in st.session_state:
+            # Initial exercise_df structure
+            st.session_state.exercise_df = exercise_df.copy()
+
+        if 'mean_igv' not in st.session_state:
+            st.session_state.mean_igv = df_cleaned['Interstitial Glucose Value'].mean()
+
+        ## !USER INPUT SECTION (MANUAL INPUT)
+        st.write('<h4>User Input Section</h4>', unsafe_allow_html=True)
+
+        m_col_1, m_col_2, m_col_3 = st.columns(3)
+        with m_col_1:
+
+            ## !USER FOOD INTAKE SECTION (USER INPUT)
+            # Dropdown for food items and user input for the amount in grams
+            with st.form("sugar_input_form"):  # Use a form to prevent immediate reruns
+                st.write('<h4>Food Intake</h4>', unsafe_allow_html=True)
+
+                col_1, col_2 = st.columns(2)
+                with col_1:
+                    st.session_state.selected_food = st.selectbox("Select a food item:", sorted(list(food_dict_carbs.keys())), 
+                                                        index=sorted(list(food_dict_carbs.keys())).index(st.session_state.selected_food))
+
+                with col_2:
+                    st.session_state.amount_in_grams = st.number_input('Amount (grams):', min_value=0.0, max_value=1000.0, step=0.1, value=st.session_state.amount_in_grams)
+                
+                submitted_food = st.form_submit_button("Add Food Intake", use_container_width=True)
+        
+                if submitted_food:
+                    add_food_intake(st.session_state.amount_in_grams)
+
+        with m_col_2:
+            ## !INSULIN DATA SECTION (USER INPUT)
+
+            insulin_concentrations = {
+                'U-100': 100,
+                'U-500': 500
+            }
+
+            with st.form("insulin_input_form"):
+                st.write('<h4>Insulin Data</h4>', unsafe_allow_html=True)
+
+                col_1, col_2 = st.columns(2)
+                with col_1:
+                    st.session_state.insulin_input_type = st.selectbox("Select insulin type:", insulin_types,
+                                                                        index=insulin_types.index(st.session_state.insulin_input_type))
+                with col_2:
+                    selected_concentration = st.selectbox(
+                        'Select insulin dose:', 
+                        list(insulin_concentrations.keys()),
+                        key='insulin_concentration'
+                    )
+                    st.session_state.insulin_input_amount = insulin_concentrations[selected_concentration]
+                
+                submitted_insulin = st.form_submit_button("Add Insulin Data", use_container_width=True)
+
+                if submitted_insulin:
+                    add_insulin_data(st.session_state.insulin_input_type, st.session_state.insulin_input_amount)
+
+        with m_col_3:
+            # !EXERCISE DATA SECTION (USER INPUT)
+            with st.form("exercise_input_form"):
+                st.write('<h4>Exercise Data</h4>', unsafe_allow_html=True)
+
+                st.session_state.exercise_input_kcal = st.number_input('Burned Calories (kcal):', min_value=0.0, max_value=10000.0, step=1.0, value=st.session_state.exercise_input_kcal)
+                
+                submitted_exercise = st.form_submit_button("Add Exercise Data", use_container_width=True)
+
+                if submitted_exercise:
+                    add_exercise_data(st.session_state.exercise_input_kcal)
 
         ## !FORECAST HORIZONS SECTION (USER INPUT)
         with st.container(border=True):
@@ -667,9 +1286,11 @@ if uploaded_glucose_file and uploaded_sugar_file:
                 st.session_state.selected_forecast_horizon_index = default_forecast_horizon_index
             
             st.write('<h4>Forecast Horizons</h4>', unsafe_allow_html=True)
+            st.write(f"**Current forecast horizon:** {forecast_horizons_list[st.session_state.selected_forecast_horizon_index]['label']}")
+            
             st.write('Select the forecast horizon for the glucose levels:')
 
-            col_1, col_2, col_3, col_4 = st.columns(4)
+            col_1, col_2, col_3, col_4 = st.columns(4, gap='large')
 
             with st.container():
                 with col_1:
@@ -691,7 +1312,6 @@ if uploaded_glucose_file and uploaded_sugar_file:
                 with col_4:
                     twenty_four_hour_button = st.button(forecast_horizons_list[7]["label"], on_click=set_selected_forecast_horizon_index, args=(7,), use_container_width=True)
         
-            st.write(f"**Selected forecast horizon:** {forecast_horizons_list[st.session_state.selected_forecast_horizon_index]['label']}")
 
         ## !PLACEHOLDER FOR THE FORECASTED GLUCOSE LEVELS CHART
         next_update_placeholder = st.empty()  # This will hold the "Next update in..." message
@@ -703,7 +1323,7 @@ if uploaded_glucose_file and uploaded_sugar_file:
         if st.button("Forecast Glucose Levels", use_container_width=True, type='primary'):
             st.session_state.is_running = True
             # Run the simulation to add new data points every 5 minutes
-            simulate_data_addition_with_forecasting(st.session_state.current_data, st.session_state.sugar_df, st.session_state.last_hour_data, interval_minutes=1)
+            simulate_data_addition_with_forecasting(st.session_state.current_data, st.session_state.last_hour_data, interval_minutes_demo=1)
 
 
     except Exception as e:
@@ -711,4 +1331,4 @@ if uploaded_glucose_file and uploaded_sugar_file:
         st.error(f"Error processing files: {e}",)
 
 else:
-    message_placeholder.info("Please upload both Glucose Data and Sugar Intake CSV files.")
+    message_placeholder.info("Please upload all necessary CSV files.")
