@@ -58,6 +58,7 @@ def get_food_data():
 
 # FOOD DICTIONARY
 food_dict_carbs, food_dict_fat = get_food_data()
+
 # INSULIN TYPES
 insulin_types = ['Fast', 'Intermediate', 'Long']
 
