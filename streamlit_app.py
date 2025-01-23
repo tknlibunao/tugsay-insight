@@ -340,6 +340,17 @@ def create_dataset(data, time_step=time_step):
         y.append(data[i + time_step, 0])
     return np.array(X), np.array(y)
 
+def get_cycle_timestamp(cycle_number):
+    # Start time for cycle 1 (as indicated by client)
+    base_time = pd.Timestamp('2020-02-29 00:03:00')
+
+    if cycle_number == 1:
+        return base_time
+    else:
+        # Add 5 minutes for each cycle after the first one
+        minutes_to_add = (cycle_number - 1) * 5
+        return base_time + pd.Timedelta(minutes=minutes_to_add)
+
 # Add user input (food intake)
 def add_food_intake(amount_in_grams):
     st.session_state.user_input_status = "USER INPUT STATUS: (has added some food intake)"
@@ -350,7 +361,7 @@ def add_food_intake(amount_in_grams):
     user_fat_intake = food_dict_fat[st.session_state.selected_food] * amount_in_grams / 100 
     
     # Get current timestamp in the correct format
-    current_time = pd.Timestamp.now()
+    current_time = get_cycle_timestamp(st.session_state.data_point_counter + 1)
     date_str = current_time.strftime('%d/%m/%Y %H:%M')  # Match the existing format
     
     # Create DataFrames for new rows
@@ -396,7 +407,7 @@ def add_insulin_data(insulin_type, amount_in_units):
     st.session_state.user_input_status = "USER INPUT STATUS: (has added some insulin data)"
 
     # Get current timestamp in the correct format
-    current_time = pd.Timestamp.now()
+    current_time = get_cycle_timestamp(st.session_state.data_point_counter + 1)
     date_str = current_time.strftime('%d/%m/%Y %H:%M')  # Match the existing format
 
     new_row_insulin = pd.DataFrame({
@@ -423,7 +434,7 @@ def add_exercise_data(amount_in_kcal):
     st.session_state.user_input_status = "USER INPUT STATUS: (has added some exercise data)"
 
     # Get current timestamp in the correct format
-    current_time = pd.Timestamp.now()
+    current_time = get_cycle_timestamp(st.session_state.data_point_counter + 1)
     date_str = current_time.strftime('%d/%m/%Y %H:%M')  # Match the existing format
     
     new_row_exercise = pd.DataFrame({
@@ -1228,16 +1239,20 @@ if uploaded_glucose_file and uploaded_sugar_file and uploaded_insulin_file and u
 
                 col_1, col_2 = st.columns(2)
                 with col_1:
-                    st.session_state.selected_food = st.selectbox("Select a food item:", sorted(list(food_dict_carbs.keys())), 
-                                                        index=sorted(list(food_dict_carbs.keys())).index(st.session_state.selected_food))
+                    selected_food = st.selectbox("Select a food item:", sorted(list(food_dict_carbs.keys())),
+                                                    key="temp_selected_food",
+                                                    index=sorted(list(food_dict_carbs.keys())).index(st.session_state.selected_food))
 
                 with col_2:
-                    st.session_state.amount_in_grams = st.number_input('Amount (grams):', min_value=0.0, max_value=1000.0, step=0.1, value=st.session_state.amount_in_grams)
+                    amount_in_grams = st.number_input('Amount (grams):', min_value=0.0, max_value=1000.0, step=0.1, key="temp_amount_in_grams")
                 
                 submitted_food = st.form_submit_button("Add Food Intake", use_container_width=True)
         
                 if submitted_food:
-                    add_food_intake(st.session_state.amount_in_grams)
+                    # Only update session state when form is submitted
+                    st.session_state.selected_food = selected_food
+                    st.session_state.amount_in_grams = amount_in_grams
+                    add_food_intake(amount_in_grams)
 
         with m_col_2:
             ## !INSULIN DATA SECTION (USER INPUT)
@@ -1252,32 +1267,35 @@ if uploaded_glucose_file and uploaded_sugar_file and uploaded_insulin_file and u
 
                 col_1, col_2 = st.columns(2)
                 with col_1:
-                    st.session_state.insulin_input_type = st.selectbox("Select insulin type:", insulin_types,
-                                                                        index=insulin_types.index(st.session_state.insulin_input_type))
+                    insulin_input_type = st.selectbox("Select insulin type:", insulin_types,
+                                                        key="temp_insulin_input_type",
+                                                        index=insulin_types.index(st.session_state.insulin_input_type))
                 with col_2:
                     selected_concentration = st.selectbox(
                         'Select insulin dose:', 
                         list(insulin_concentrations.keys()),
-                        key='insulin_concentration'
+                        key='temp_insulin_concentration'
                     )
-                    st.session_state.insulin_input_amount = insulin_concentrations[selected_concentration]
                 
                 submitted_insulin = st.form_submit_button("Add Insulin Data", use_container_width=True)
 
                 if submitted_insulin:
-                    add_insulin_data(st.session_state.insulin_input_type, st.session_state.insulin_input_amount)
+                    st.session_state.insulin_input_type = insulin_input_type
+                    st.session_state.insulin_input_amount = insulin_concentrations[selected_concentration]
+                    add_insulin_data(insulin_input_type, insulin_concentrations[selected_concentration])
 
         with m_col_3:
             # !EXERCISE DATA SECTION (USER INPUT)
             with st.form("exercise_input_form"):
                 st.write('<h4>Exercise Data</h4>', unsafe_allow_html=True)
 
-                st.session_state.exercise_input_kcal = st.number_input('Burned Calories (kcal):', min_value=0.0, max_value=10000.0, step=1.0, value=st.session_state.exercise_input_kcal)
+                exercise_input_kcal = st.number_input('Burned Calories (kcal):', min_value=0.0, max_value=10000.0, step=1.0, key="temp_exercise_input_kcal")
                 
                 submitted_exercise = st.form_submit_button("Add Exercise Data", use_container_width=True)
 
                 if submitted_exercise:
-                    add_exercise_data(st.session_state.exercise_input_kcal)
+                    st.session_state.exercise_input_kcal = exercise_input_kcal
+                    add_exercise_data(exercise_input_kcal)
 
         ## !FORECAST HORIZONS SECTION (USER INPUT)
         with st.container(border=True):
