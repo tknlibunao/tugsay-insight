@@ -1061,7 +1061,7 @@ def simulate_data_addition_with_forecasting(df_cleaned, last_hour_data, interval
                     base = alt.Chart(combined_data).encode(
                         x=alt.X('Time:T', axis=alt.Axis(format='%b %d, %Y (%-I%p)', tickCount=24)),  # Show hour and minute for every tick
                         tooltip=[
-                            alt.Tooltip('Time:T', title='Time', format='%b %d, %Y (%-I%p)'),
+                            alt.Tooltip('Time:T', title='Time', format='%b %d, %Y (%-I:%M %p)'),
                             alt.Tooltip('Glucose Level:Q', title='Glucose Level', format='.1f'),
                             alt.Tooltip('Type:N', title='Type'),
                             alt.Tooltip('Glucose Category:N', title='Status')  # Include the glucose category in the tooltip
