@@ -33,16 +33,21 @@ logging.basicConfig(
 
 ### STREAMLIT APPLICATION
 st.set_page_config(page_title="STROMA", page_icon="📉", layout="wide")
-st.markdown("""
-        <style>
-            h3#forecasted-glucose-levels {
-                color: #004AAD;
-            }
-            h4#simulation-values-tracker {
-                margin-top: 30px;
-            }
-        </style>
-    """, unsafe_allow_html=True)
+# CSS to style specific headings and hide the GitHub and menu toolbar
+custom_css = """
+    <style>
+        h3#forecasted-glucose-levels {
+            color: #004AAD;  /* Blue color for specific heading */
+        }
+        h4#simulation-values-tracker {
+            margin-top: 30px;  /* Additional top margin for another heading */
+        }
+        div[data-testid="stToolbarActions"] {
+            display: none !important;  /* Hide the toolbar actions */
+        }
+    </style>
+    """
+st.markdown(custom_css, unsafe_allow_html=True)
 
 ### DEFINE FUNCTIONS, SESSION STATES, AND CONSTANTS
 def get_food_data():
