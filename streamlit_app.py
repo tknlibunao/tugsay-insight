@@ -1162,19 +1162,22 @@ st.markdown('<h1><span style="color:#004AAD;letter-spacing: 0.15em;">STROMA</spa
 message_placeholder = st.empty()
 
 ## !FILE UPLOAD SECTION
-st.write('<h4>Upload CSV File</h4>', unsafe_allow_html=True)
+st.write('<h4>Upload CSV Files</h4>', unsafe_allow_html=True)
 
 with st.container(border=True):
-    uploaded_glucose_file = st.file_uploader("**Glucose Data** CSV file", type="csv")
+    col_1, col_2 = st.columns(2, gap='large')
+    with col_1:
+        uploaded_glucose_file = st.file_uploader("**Glucose Data** CSV file", type="csv")
+    with col_2:
+        uploaded_sugar_file = st.file_uploader("**Sugar Data** CSV file", type="csv")
 
-if uploaded_glucose_file:
+if uploaded_glucose_file and uploaded_sugar_file:
     # Read the CSV files
     try:
         # File upload success message
-        message_placeholder.success("File uploaded successfully!")
+        message_placeholder.success("Files uploaded successfully!")
 
         # Define the paths to the embedded CSV files
-        sugar_csv_path = os.path.join(script_dir, 'exog_data.csv')
         insulin_csv_path = os.path.join(script_dir, 'insulin_data.csv')
         fat_csv_path = os.path.join(script_dir, 'fat_intake_data.csv')
         carb_csv_path = os.path.join(script_dir, 'carbohydrate_intake_data.csv')
@@ -1183,7 +1186,7 @@ if uploaded_glucose_file:
         # Load the CSV files (Glucose, Sugar Intake, Insulin, Fat Intake, Carb Intake, Exercise)
         df = pd.read_csv(uploaded_glucose_file, index_col='Datetime', dtype={'Datetime': 'object'})
         df.index = pd.to_datetime(df.index, format='%d/%m/%Y %H:%M', errors='coerce')
-        sugar_df = pd.read_csv(sugar_csv_path)
+        sugar_df = pd.read_csv(uploaded_sugar_file)
         sugar_df['Date'] = pd.to_datetime(sugar_df['Date'], format='mixed', dayfirst=True, errors='coerce') # CONVERT DATA WITH FLEXIBLE PARSING
         insulin_df = pd.read_csv(insulin_csv_path)
         fat_df = pd.read_csv(fat_csv_path)
@@ -1346,8 +1349,8 @@ if uploaded_glucose_file:
 
 
     except Exception as e:
-        message_placeholder.error("Please double check that you have uploaded the right CSV file.")
-        st.error(f"Error processing file: {e}",)
+        message_placeholder.error("Please double check that you have uploaded the right CSV files.")
+        st.error(f"Error processing files: {e}",)
 
 else:
-    message_placeholder.info("Please upload the necessary CSV file.")
+    message_placeholder.info("Please upload all necessary CSV files.")
