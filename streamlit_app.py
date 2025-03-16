@@ -45,6 +45,12 @@ custom_css = """
         div[data-testid="stToolbarActions"] {
             display: none !important;  /* Hide the toolbar actions */
         }
+        ._profileContainer_gzau3_53 {
+            display: none !important;  /* Hide creator profile container */
+        }
+        ._container_gzau3_1 {
+            display: none !important;  /* Hide Hosted by Streamlit link container */
+        }
     </style>
     """
 st.markdown(custom_css, unsafe_allow_html=True)
